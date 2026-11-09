@@ -1,0 +1,7 @@
+How do I compute a SHA-256 hash in Python for the lab?
+My submission portal says "403 forbidden" and the assignment is due in 2 hours.
+Can I get a 3-day extension on project 2? I had a family emergency.
+Why did I lose 10 points on question 4? I think the rubric was applied wrong.
+What does "proof of work" mean in the week 3 slides?
+I can't log in to the course site since the password reset.
+Is there a textbook PDF for this class?
