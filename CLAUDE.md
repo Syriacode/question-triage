@@ -22,7 +22,7 @@ python -m ruff format --check .
 
 ## Plan
 
-- `GUIDE.md` holds the step-by-step plan once it's added.
+- `GUIDE.md` (Mon: the CLI) and `GUIDE-evals.md` (Tue: evals) hold the step-by-step plans. Don't edit them.
 
 ## Environment
 
