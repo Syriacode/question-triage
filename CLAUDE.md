@@ -16,6 +16,10 @@ python -m ruff check .
 python -m ruff format --check .
 ```
 
+- Activate the venv before starting Claude Code: source .venv/Scripts/activate.
+- Tests must never call a real model. Use FakeClient. Real calls go in tests marked @pytest.mark.live.
+- Run python -m ruff format . after editing Python files.
+
 ## Plan
 
 - `GUIDE.md` holds the step-by-step plan once it's added.

@@ -31,3 +31,6 @@ jobs:
 
       - name: Test
         run: python -m pytest -v
+
+      - name: Smoke test the CLI
+        run: python -m triage --provider fake classify "Is there a textbook PDF?"
