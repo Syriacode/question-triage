@@ -81,6 +81,8 @@ def classify(
             response = client.chat(messages, schema=schema, temperature=temperature)
         except LLMError as err:
             last_error = str(err)
+            if log:
+                log.record(model=client.model, attempt=attempt, ok=False, error=last_error)
             if attempt < max_attempts:
                 sleep(2 ** (attempt - 1))
             continue
@@ -89,6 +91,16 @@ def classify(
             result = Triage.model_validate_json(response.text)
         except ValidationError as err:
             last_error = f"invalid output: {describe_errors(err)}"
+            if log:
+                log.record(
+                    model=response.model,
+                    attempt=attempt,
+                    ok=False,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    latency_ms=response.latency_ms,
+                    error=last_error,
+                )
             messages = [
                 *messages,
                 {"role": "assistant", "content": response.text},
@@ -99,6 +111,16 @@ def classify(
                 },
             ]
             continue
+
+        if log:
+            log.record(
+                model=response.model,
+                attempt=attempt,
+                ok=True,
+                input_tokens=response.input_tokens,
+                output_tokens=response.output_tokens,
+                latency_ms=response.latency_ms,
+            )
 
         return apply_policy(result)
 

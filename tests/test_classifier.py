@@ -4,6 +4,7 @@ import pytest
 
 from triage.classifier import TriageError, classify
 from triage.llm import FakeClient, LLMError
+from triage.usage_log import UsageLog
 
 QUESTION = "The submission site is down and my project is due in one hour."
 
@@ -70,3 +71,14 @@ def test_high_urgency_always_needs_a_human():
     result = classify(QUESTION, client, sleep=no_sleep)
 
     assert result.needs_human is True
+
+
+def test_every_attempt_is_logged(tmp_path):
+    client = FakeClient(["oops", good_reply()])
+    log = UsageLog(tmp_path / "usage.jsonl")
+
+    classify(QUESTION, client, log=log, sleep=no_sleep)
+
+    records = log.read()
+    assert [(record.attempt, record.ok) for record in records] == [(1, False), (2, True)]
+    assert records[1].input_tokens == 100
