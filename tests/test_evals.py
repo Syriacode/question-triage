@@ -3,7 +3,19 @@ import json
 import pytest
 
 from triage.classifier import SYSTEM_PROMPT
-from triage.evals import CalibrationExample, check_judge, fingerprint, load_golden, run_eval
+from triage.evals import (
+    ERROR,
+    CalibrationExample,
+    RowResult,
+    Thresholds,
+    as_label,
+    build_report,
+    check_judge,
+    fingerprint,
+    gate,
+    load_golden,
+    run_eval,
+)
 from triage.llm import FakeClient
 
 
@@ -171,3 +183,87 @@ def test_check_judge_reports_agreement_and_disagreements():
     assert agreement == 0.5
     assert len(disagreements) == 1
     assert disagreements[0][0] == bad
+
+
+THRESHOLDS = Thresholds(
+    min_accuracy={"topic": 0.5, "urgency": 0.5, "needs_human": 0.5},
+    min_recall={"needs_human:true": 0.9},
+    max_errors=0,
+    min_judge_pass_rate=0.5,
+)
+
+
+def gold_labels(example):
+    return {
+        field: as_label(getattr(example, field)) for field in ("topic", "urgency", "needs_human")
+    }
+
+
+def perfect_report(golden):
+    rows = [
+        RowResult(
+            id=example.id,
+            question=example.question,
+            hard=example.hard,
+            gold=gold_labels(example),
+            pred=gold_labels(example),
+            explanation="Right answer.",
+            judge_passed=True,
+            judge_reason="Fine.",
+        )
+        for example in load_golden(golden)
+    ]
+    return build_report(rows, "fake", fingerprint(golden), judge_model="fake")
+
+
+def test_gate_passes_good_fresh_results(golden):
+    assert gate(perfect_report(golden), THRESHOLDS, fingerprint(golden), 3) == []
+
+
+def test_gate_fails_stale_results(golden):
+    failures = gate(perfect_report(golden), THRESHOLDS, "0000000000000000", 3)
+
+    assert len(failures) == 1
+    assert "stale" in failures[0]
+
+
+def test_gate_fails_partial_run(golden):
+    failures = gate(perfect_report(golden), THRESHOLDS, fingerprint(golden), 50)
+
+    assert failures == ["results cover 3 of 50 golden examples"]
+
+
+def test_gate_fails_low_accuracy_recall_errors_and_judge(golden):
+    q1, q2, q3 = load_golden(golden)
+    rows = [
+        RowResult(
+            id=q1.id,
+            question=q1.question,
+            hard=q1.hard,
+            gold=gold_labels(q1),
+            pred={field: ERROR for field in ("topic", "urgency", "needs_human")},
+            error="boom",
+        ),
+        RowResult(
+            id=q2.id,
+            question=q2.question,
+            hard=q2.hard,
+            gold=gold_labels(q2),
+            pred={**gold_labels(q2), "topic": "course_content"},
+            judge_passed=False,
+        ),
+        RowResult(
+            id=q3.id,
+            question=q3.question,
+            hard=q3.hard,
+            gold=gold_labels(q3),
+            pred={**gold_labels(q3), "needs_human": "false"},
+            judge_passed=False,
+        ),
+    ]
+    report = build_report(rows, "fake", fingerprint(golden), judge_model="fake")
+
+    failures = gate(report, THRESHOLDS, fingerprint(golden), 3)
+
+    for start in ("topic accuracy", "needs_human:true recall", "1 errors > 0", "judge pass rate"):
+        assert any(failure.startswith(start) for failure in failures), start

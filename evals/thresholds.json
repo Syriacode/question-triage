@@ -1,0 +1,6 @@
+{
+  "min_accuracy": {"topic": 0.75, "urgency": 0.6, "needs_human": 0.8},
+  "min_recall": {"needs_human:true": 0.8},
+  "max_errors": 0,
+  "min_judge_pass_rate": 0.35
+}
