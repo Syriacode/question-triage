@@ -2,7 +2,24 @@ import json
 
 import pytest
 
-from triage.evals import load_golden
+from triage.classifier import SYSTEM_PROMPT
+from triage.evals import fingerprint, load_golden, run_eval
+from triage.llm import FakeClient
+
+
+def no_sleep(seconds):
+    pass
+
+
+def reply(topic, urgency, needs_human):
+    return json.dumps(
+        {
+            "topic": topic,
+            "urgency": urgency,
+            "needs_human": needs_human,
+            "explanation": "Fake reply for the test.",
+        }
+    )
 
 
 def golden_row(id_, topic="other", urgency="low", needs_human=False, **extra):
@@ -64,3 +81,50 @@ def test_duplicate_ids_are_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="duplicate ids"):
         load_golden(path)
+
+
+def test_fingerprint_changes_when_prompt_or_golden_changes(golden, monkeypatch):
+    before = fingerprint(golden)
+
+    monkeypatch.setattr("triage.evals.SYSTEM_PROMPT", SYSTEM_PROMPT + " ")
+    assert fingerprint(golden) != before
+
+    monkeypatch.undo()
+    assert fingerprint(golden) == before
+
+    with golden.open("a", encoding="utf-8") as file:
+        file.write(golden_row("q4") + "\n")
+    assert fingerprint(golden) != before
+
+
+def test_fingerprint_ignores_windows_line_endings(tmp_path):
+    lf = tmp_path / "lf.jsonl"
+    crlf = tmp_path / "crlf.jsonl"
+    text = golden_row("q1") + "\n" + golden_row("q2") + "\n"
+    lf.write_bytes(text.encode("utf-8"))
+    crlf.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+
+    assert fingerprint(crlf) == fingerprint(lf)
+
+
+def test_run_eval_scores_predictions_and_counts_errors(golden):
+    client = FakeClient(
+        [
+            reply("technical_issue", "high", True),
+            reply("course_content", "low", False),
+            "bad",
+            "bad",
+            "bad",
+        ]
+    )
+
+    report = run_eval(load_golden(golden), client, fingerprint="test", sleep=no_sleep)
+
+    assert report.examples == 3
+    assert report.errors == 1
+    assert report.accuracy["topic"] == pytest.approx(1 / 3, abs=1e-3)
+    assert report.accuracy["urgency"] == pytest.approx(2 / 3, abs=1e-3)
+    assert report.exact_match == pytest.approx(1 / 3, abs=1e-3)
+    assert report.hard_exact_match == 0.0
+    assert report.rows[2].pred["topic"] == "ERROR"
+    assert report.per_label["needs_human"]["true"].recall == pytest.approx(0.5)
