@@ -6,6 +6,18 @@ from pathlib import Path
 from typing import TextIO
 
 from triage.classifier import TriageError, classify
+from triage.evals import (
+    EvalReport,
+    RowResult,
+    Thresholds,
+    check_judge,
+    fingerprint,
+    format_report,
+    gate,
+    load_calibration,
+    load_golden,
+    run_eval,
+)
 from triage.llm import LLMClient, make_client
 from triage.usage_log import UsageLog, summarize
 
@@ -32,6 +44,22 @@ def build_parser() -> argparse.ArgumentParser:
     price_help = "what-if price, USD per 1M input/output tokens"
     stats_parser.add_argument("--price-in", type=float, default=0.0, help=price_help)
     stats_parser.add_argument("--price-out", type=float, default=0.0, help=price_help)
+    eval_parser = subcommands.add_parser("eval")
+    eval_parser.add_argument("--golden", type=Path, default=Path("evals/golden.jsonl"))
+    eval_parser.add_argument("--out", type=Path, default=Path("evals/results.json"))
+    eval_parser.add_argument("--limit", type=int, default=None, help="only the first N examples")
+    judge_help = "model for the judge (default: same as --model)"
+    eval_parser.add_argument("--judge-model", default=None, help=judge_help)
+    eval_parser.add_argument("--no-judge", action="store_true", help="skip the LLM judge")
+    judge_check_parser = subcommands.add_parser("judge-check")
+    judge_check_parser.add_argument(
+        "--file", type=Path, default=Path("evals/judge_calibration.jsonl")
+    )
+    judge_check_parser.add_argument("--judge-model", default=None, help=judge_help)
+    gate_parser = subcommands.add_parser("gate")
+    gate_parser.add_argument("--golden", type=Path, default=Path("evals/golden.jsonl"))
+    gate_parser.add_argument("--results", type=Path, default=Path("evals/results.json"))
+    gate_parser.add_argument("--thresholds", type=Path, default=Path("evals/thresholds.json"))
     return parser
 
 
@@ -63,6 +91,77 @@ def _run_batch(path: Path, client: LLMClient, log: UsageLog, stdout: TextIO) -> 
     return exit_code
 
 
+def _judge_client(args: argparse.Namespace) -> LLMClient:
+    return make_client(args.provider, args.judge_model or args.model, args.ollama_url)
+
+
+def _run_judge_check(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
+    try:
+        examples = load_calibration(args.file)
+    except (OSError, ValueError) as err:
+        print(f"error: {err}", file=stderr)
+        return 1
+    agreement, disagreements = check_judge(examples, _judge_client(args))
+    print(
+        f"judge agrees with you on {round(agreement * 100)}% of {len(examples)} examples",
+        file=stdout,
+    )
+    for example, reason in disagreements:
+        human = "true" if example.human_pass else "false"
+        print(f"- you said pass={human}, {reason}", file=stdout)
+        print(f"  {example.explanation}", file=stdout)
+    return 0
+
+
+def _run_gate(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
+    try:
+        report = EvalReport.model_validate_json(args.results.read_text(encoding="utf-8"))
+        thresholds = Thresholds.model_validate_json(args.thresholds.read_text(encoding="utf-8"))
+        examples = load_golden(args.golden)
+        current_fingerprint = fingerprint(args.golden)
+    except (OSError, ValueError) as err:
+        print(f"FAIL {err}", file=stderr)
+        return 1
+
+    failures = gate(report, thresholds, current_fingerprint, len(examples))
+    if failures:
+        for failure in failures:
+            print(f"FAIL {failure}", file=stderr)
+        return 1
+    print(f"eval gate passed ({report.examples} examples, model {report.model})", file=stdout)
+    return 0
+
+
+def _run_eval(
+    args: argparse.Namespace, client: LLMClient, log: UsageLog, stdout: TextIO, stderr: TextIO
+) -> int:
+    try:
+        examples = load_golden(args.golden)
+        golden_fingerprint = fingerprint(args.golden)
+    except (OSError, ValueError) as err:
+        print(f"error: {err}", file=stderr)
+        return 1
+    examples = examples[: args.limit]
+    total = len(examples)
+
+    def show_progress(index: int, _row: RowResult) -> None:
+        print(f"{index}/{total}", end="\r", file=stderr, flush=True)
+
+    report = run_eval(
+        examples,
+        client,
+        fingerprint=golden_fingerprint,
+        log=log,
+        on_row=show_progress,
+        judge_client=None if args.no_judge else _judge_client(args),
+    )
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    print(format_report(report), file=stdout)
+    print(f"saved {args.out}", file=stdout)
+    return 0
+
+
 def main(argv: list[str], stdout: TextIO, stderr: TextIO) -> int:
     try:
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -75,8 +174,14 @@ def main(argv: list[str], stdout: TextIO, stderr: TextIO) -> int:
         summary = summarize(log.read(), args.price_in, args.price_out)
         print(json.dumps(summary, indent=2), file=stdout)
         return 0
+    if args.command == "gate":
+        return _run_gate(args, stdout, stderr)
+    if args.command == "judge-check":
+        return _run_judge_check(args, stdout, stderr)
 
     client = make_client(args.provider, args.model, args.ollama_url)
     if args.command == "classify":
         return _run_classify(args.question, client, log, stdout, stderr)
+    if args.command == "eval":
+        return _run_eval(args, client, log, stdout, stderr)
     return _run_batch(args.file, client, log, stdout)
