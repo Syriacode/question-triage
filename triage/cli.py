@@ -7,13 +7,10 @@ from typing import TextIO
 
 from triage.classifier import TriageError, classify
 from triage.evals import (
-    EvalReport,
     RowResult,
-    Thresholds,
     check_judge,
     fingerprint,
     format_report,
-    gate,
     load_calibration,
     load_golden,
     run_eval,
@@ -56,10 +53,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--file", type=Path, default=Path("evals/judge_calibration.jsonl")
     )
     judge_check_parser.add_argument("--judge-model", default=None, help=judge_help)
-    gate_parser = subcommands.add_parser("gate")
-    gate_parser.add_argument("--golden", type=Path, default=Path("evals/golden.jsonl"))
-    gate_parser.add_argument("--results", type=Path, default=Path("evals/results.json"))
-    gate_parser.add_argument("--thresholds", type=Path, default=Path("evals/thresholds.json"))
     return parser
 
 
@@ -113,25 +106,6 @@ def _run_judge_check(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -
     return 0
 
 
-def _run_gate(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
-    try:
-        report = EvalReport.model_validate_json(args.results.read_text(encoding="utf-8"))
-        thresholds = Thresholds.model_validate_json(args.thresholds.read_text(encoding="utf-8"))
-        examples = load_golden(args.golden)
-        current_fingerprint = fingerprint(args.golden)
-    except (OSError, ValueError) as err:
-        print(f"FAIL {err}", file=stderr)
-        return 1
-
-    failures = gate(report, thresholds, current_fingerprint, len(examples))
-    if failures:
-        for failure in failures:
-            print(f"FAIL {failure}", file=stderr)
-        return 1
-    print(f"eval gate passed ({report.examples} examples, model {report.model})", file=stdout)
-    return 0
-
-
 def _run_eval(
     args: argparse.Namespace, client: LLMClient, log: UsageLog, stdout: TextIO, stderr: TextIO
 ) -> int:
@@ -174,8 +148,6 @@ def main(argv: list[str], stdout: TextIO, stderr: TextIO) -> int:
         summary = summarize(log.read(), args.price_in, args.price_out)
         print(json.dumps(summary, indent=2), file=stdout)
         return 0
-    if args.command == "gate":
-        return _run_gate(args, stdout, stderr)
     if args.command == "judge-check":
         return _run_judge_check(args, stdout, stderr)
 

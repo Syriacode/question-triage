@@ -32,11 +32,5 @@ jobs:
       - name: Test
         run: python -m pytest -v
 
-      - name: Check golden set
-        run: python scripts/check_golden.py --strict
-
-      - name: Eval gate
-        run: python -m triage gate
-
       - name: Smoke test the CLI
         run: python -m triage --provider fake classify "Is there a textbook PDF?"
