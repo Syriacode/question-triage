@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from triage import metrics
 from triage.classifier import SYSTEM_PROMPT, TriageError, classify
+from triage.judge import JUDGE_PROMPT, JudgeError, judge_explanation
 from triage.llm import LLMClient
 from triage.schemas import Topic, Triage, Urgency
 from triage.usage_log import UsageLog
@@ -62,6 +63,7 @@ def fingerprint(golden_path: Path) -> str:
     digest = hashlib.sha256()
     digest.update(SYSTEM_PROMPT.encode("utf-8"))
     digest.update(json.dumps(Triage.model_json_schema(), sort_keys=True).encode("utf-8"))
+    digest.update(JUDGE_PROMPT.encode("utf-8"))
     digest.update(golden_path.read_bytes().replace(b"\r\n", b"\n"))
     return digest.hexdigest()[:16]
 
@@ -114,6 +116,7 @@ def run_eval(
     log: UsageLog | None = None,
     on_row: Callable[[int, RowResult], None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    judge_client: LLMClient | None = None,
 ) -> EvalReport:
     rows: list[RowResult] = []
     for index, example in enumerate(examples, start=1):
@@ -128,10 +131,20 @@ def run_eval(
         else:
             pred = {field: as_label(getattr(result, field)) for field in FIELDS}
             row = RowResult(**common, gold=gold, pred=pred, explanation=result.explanation)
+            if judge_client is not None:
+                try:
+                    verdict = judge_explanation(example.question, result, judge_client)
+                except JudgeError as err:
+                    row.judge_passed = False
+                    row.judge_reason = f"judge error: {err}"
+                else:
+                    row.judge_passed = verdict.passed
+                    row.judge_reason = verdict.reason
         rows.append(row)
         if on_row is not None:
             on_row(index, row)
-    return build_report(rows, client.model, fingerprint)
+    judge_model = judge_client.model if judge_client is not None else None
+    return build_report(rows, client.model, fingerprint, judge_model=judge_model)
 
 
 def _exact_match(rows: Sequence[RowResult]) -> float:
@@ -140,7 +153,13 @@ def _exact_match(rows: Sequence[RowResult]) -> float:
     return round(sum(row.gold == row.pred for row in rows) / len(rows), 3)
 
 
-def build_report(rows: Sequence[RowResult], model: str, fingerprint: str) -> EvalReport:
+def build_report(
+    rows: Sequence[RowResult],
+    model: str,
+    fingerprint: str,
+    *,
+    judge_model: str | None = None,
+) -> EvalReport:
     accuracy: dict[str, float] = {}
     per_label: dict[str, dict[str, LabelRow]] = {}
     confusions: dict[str, list[tuple[str, str, int]]] = {}
@@ -158,10 +177,15 @@ def build_report(rows: Sequence[RowResult], model: str, fingerprint: str) -> Eva
         }
         confusions[field] = metrics.top_confusions(gold, pred)
 
+    judged = [row for row in rows if row.judge_passed is not None]
+    judge_pass_rate = (
+        round(sum(bool(row.judge_passed) for row in judged) / len(judged), 3) if judged else None
+    )
+
     return EvalReport(
         fingerprint=fingerprint,
         model=model,
-        judge_model=None,
+        judge_model=judge_model,
         created_at=datetime.now(UTC).isoformat(timespec="seconds"),
         examples=len(rows),
         errors=sum(row.error is not None for row in rows),
@@ -170,7 +194,7 @@ def build_report(rows: Sequence[RowResult], model: str, fingerprint: str) -> Eva
         hard_exact_match=_exact_match([row for row in rows if row.hard]),
         per_label=per_label,
         confusions=confusions,
-        judge_pass_rate=None,
+        judge_pass_rate=judge_pass_rate,
         rows=list(rows),
     )
 
@@ -183,6 +207,8 @@ def format_report(report: EvalReport) -> str:
         + f"   exact match {report.exact_match:.2f}"
         + f"   hard slice {report.hard_exact_match:.2f}",
     ]
+    if report.judge_pass_rate is not None:
+        lines.append(f"judge ({report.judge_model}) pass rate: {report.judge_pass_rate:.2f}")
     for field in FIELDS:
         labels = report.per_label[field]
         width = max([len("label"), *(len(label) for label in labels)])
@@ -196,3 +222,52 @@ def format_report(report: EvalReport) -> str:
         for gold, pred, count in report.confusions[field]:
             lines.append(f"  confused: {gold} -> {pred} ({count}x)")
     return "\n".join(lines)
+
+
+class CalibrationExample(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+    topic: Topic
+    urgency: Urgency
+    needs_human: bool
+    explanation: str
+    human_pass: bool
+
+
+def load_calibration(path: Path) -> list[CalibrationExample]:
+    examples: list[CalibrationExample] = []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            examples.append(CalibrationExample.model_validate_json(line))
+        except ValidationError as err:
+            raise ValueError(f"{path}:{line_number}: {err}") from err
+    return examples
+
+
+def check_judge(
+    examples: Sequence[CalibrationExample], client: LLMClient
+) -> tuple[float, list[tuple[CalibrationExample, str]]]:
+    agree = 0
+    disagreements: list[tuple[CalibrationExample, str]] = []
+    for example in examples:
+        result = Triage(
+            topic=example.topic,
+            urgency=example.urgency,
+            needs_human=example.needs_human,
+            explanation=example.explanation,
+        )
+        try:
+            verdict = judge_explanation(example.question, result, client)
+        except JudgeError as err:
+            disagreements.append((example, f"judge error: {err}"))
+            continue
+        if verdict.passed == example.human_pass:
+            agree += 1
+        else:
+            disagreements.append((example, verdict.reason))
+    agreement = round(agree / len(examples), 3) if examples else 0.0
+    return agreement, disagreements

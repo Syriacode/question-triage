@@ -6,7 +6,15 @@ from pathlib import Path
 from typing import TextIO
 
 from triage.classifier import TriageError, classify
-from triage.evals import RowResult, fingerprint, format_report, load_golden, run_eval
+from triage.evals import (
+    RowResult,
+    check_judge,
+    fingerprint,
+    format_report,
+    load_calibration,
+    load_golden,
+    run_eval,
+)
 from triage.llm import LLMClient, make_client
 from triage.usage_log import UsageLog, summarize
 
@@ -37,6 +45,14 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--golden", type=Path, default=Path("evals/golden.jsonl"))
     eval_parser.add_argument("--out", type=Path, default=Path("evals/results.json"))
     eval_parser.add_argument("--limit", type=int, default=None, help="only the first N examples")
+    judge_help = "model for the judge (default: same as --model)"
+    eval_parser.add_argument("--judge-model", default=None, help=judge_help)
+    eval_parser.add_argument("--no-judge", action="store_true", help="skip the LLM judge")
+    judge_check_parser = subcommands.add_parser("judge-check")
+    judge_check_parser.add_argument(
+        "--file", type=Path, default=Path("evals/judge_calibration.jsonl")
+    )
+    judge_check_parser.add_argument("--judge-model", default=None, help=judge_help)
     return parser
 
 
@@ -68,6 +84,28 @@ def _run_batch(path: Path, client: LLMClient, log: UsageLog, stdout: TextIO) -> 
     return exit_code
 
 
+def _judge_client(args: argparse.Namespace) -> LLMClient:
+    return make_client(args.provider, args.judge_model or args.model, args.ollama_url)
+
+
+def _run_judge_check(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
+    try:
+        examples = load_calibration(args.file)
+    except (OSError, ValueError) as err:
+        print(f"error: {err}", file=stderr)
+        return 1
+    agreement, disagreements = check_judge(examples, _judge_client(args))
+    print(
+        f"judge agrees with you on {round(agreement * 100)}% of {len(examples)} examples",
+        file=stdout,
+    )
+    for example, reason in disagreements:
+        human = "true" if example.human_pass else "false"
+        print(f"- you said pass={human}, {reason}", file=stdout)
+        print(f"  {example.explanation}", file=stdout)
+    return 0
+
+
 def _run_eval(
     args: argparse.Namespace, client: LLMClient, log: UsageLog, stdout: TextIO, stderr: TextIO
 ) -> int:
@@ -84,7 +122,12 @@ def _run_eval(
         print(f"{index}/{total}", end="\r", file=stderr, flush=True)
 
     report = run_eval(
-        examples, client, fingerprint=golden_fingerprint, log=log, on_row=show_progress
+        examples,
+        client,
+        fingerprint=golden_fingerprint,
+        log=log,
+        on_row=show_progress,
+        judge_client=None if args.no_judge else _judge_client(args),
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
@@ -105,6 +148,8 @@ def main(argv: list[str], stdout: TextIO, stderr: TextIO) -> int:
         summary = summarize(log.read(), args.price_in, args.price_out)
         print(json.dumps(summary, indent=2), file=stdout)
         return 0
+    if args.command == "judge-check":
+        return _run_judge_check(args, stdout, stderr)
 
     client = make_client(args.provider, args.model, args.ollama_url)
     if args.command == "classify":
